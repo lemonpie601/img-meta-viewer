@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         이미지 메타데이터 뷰어
+// @name         이미지 메타데이터 뷰어 (아카라이브 / 디시인사이드)
 // @namespace    https://github.com/local/img-meta-viewer
-// @version      4.3.0
+// @version      4.4.0
 // @description  아카라이브·디시인사이드에서 이미지를 Alt+클릭하면 페이지 안에 카드 팝업이 뜨고, EXIF와 NovelAI·ComfyUI·A1111 등 각종 AI 생성 메타데이터를 보여줍니다. 사이트 다크/라이트 테마 자동 대응.
 // @author       you
 // @match        https://arca.live/*
@@ -1321,6 +1321,9 @@
 
   // 메타데이터는 대부분 파일 앞쪽에 있으므로 우선 이만큼만 받는다
   const HEAD_BYTES = 384 * 1024;
+  // 앞부분에서 아무것도 못 찾았을 때 전체를 다시 확인하는 크기 한도
+  // (메타데이터를 파일 뒤쪽에 붙여 저장하는 프로그램도 있다)
+  const FULL_RETRY_MAX = 30 * 1024 * 1024;
   // 이보다 큰 파일은 은닉 메타데이터 검사를 자동으로 하지 않는다 (버튼으로 넘김)
   const STEALTH_AUTO_MAX = 12 * 1024 * 1024;
 
@@ -1349,6 +1352,16 @@
       if (!full) { const r2 = await fetchBytes(res.url); bytes = r2.u8; full = true; }
       return bytes;
     };
+
+    // 앞부분만 받았는데 아무것도 못 찾았으면 파일 전체를 다시 살펴본다.
+    // 메타데이터가 파일 끝쪽에 붙어 있는 경우가 있다.
+    if (!full && !info.gen && !info.exif && totalSize <= FULL_RETRY_MAX) {
+      try {
+        await getFull();
+        const again = await analyze(bytes, null);
+        if (metaScore(again) >= metaScore(info)) info = again;
+      } catch (e) { /* 앞부분 결과로 진행 */ }
+    }
 
     // 은닉 메타데이터 확인은 파일 전체가 필요하다.
     // 파일이 크면 자동으로 받지 않고 버튼으로 넘긴다.
