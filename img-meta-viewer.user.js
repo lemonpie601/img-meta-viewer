@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         이미지 메타데이터 뷰어
 // @namespace    https://github.com/local/img-meta-viewer
-// @version      4.5.0
+// @version      4.7.0
 // @description  아카라이브·디시인사이드에서 이미지를 Alt+클릭하면 페이지 안에 카드 팝업이 뜨고, EXIF와 NovelAI·ComfyUI·A1111 등 각종 AI 생성 메타데이터를 보여줍니다. 사이트 다크/라이트 테마 자동 대응.
 // @author       you
 // @match        https://arca.live/*
@@ -767,9 +767,27 @@
 
     // EXIF 안에 들어있는 생성 정보도 감지기에 넘긴다
     if (info.exif) {
-      if (info.exif.UserComment) info.text.UserComment = info.exif.UserComment;
-      info.text.__exifDescription = info.exif.ImageDescription || '';
-      info.text.__exifArtist = info.exif.Artist || '';
+      const e = info.exif;
+      if (e.UserComment) {
+        info.text.UserComment = e.UserComment;
+        // NovelAI 등은 PNG 텍스트 청크 묶음을 통째로 JSON 으로 만들어
+        // EXIF UserComment 안에 넣는다 (webp/jpg 로 저장할 때).
+        const j = safeJSON(e.UserComment);
+        if (j && typeof j === 'object' && !Array.isArray(j)) {
+          for (const k of ['Comment', 'Description', 'Software', 'Source', 'Generation_time',
+            'parameters', 'prompt', 'workflow', 'sd-metadata', 'invokeai_metadata']) {
+            if (typeof j[k] === 'string' && info.text[k] === undefined) info.text[k] = j[k];
+          }
+        }
+      }
+      // 생성 프로그램이 EXIF 태그에 직접 적혀 있는 경우
+      const sw = e.Software || '';
+      if (/NovelAI|Stable ?Diffusion|ComfyUI|Fooocus|Invoke|Draw ?Things|Midjourney|NijiJourney/i.test(sw)) {
+        if (info.text.Software === undefined) info.text.Software = sw;
+        if (info.text.Description === undefined && e.ImageDescription) info.text.Description = e.ImageDescription;
+      }
+      info.text.__exifDescription = e.ImageDescription || '';
+      info.text.__exifArtist = e.Artist || '';
     }
     if (info.xmp) {
       const m = info.xmp.match(/<dc:description>[\s\S]*?<rdf:li[^>]*>([\s\S]*?)<\/rdf:li>/);
@@ -1472,7 +1490,9 @@
       class: 'imv-bdg' + (gen ? '' : ' plain'), text: gen ? gen.source : '생성 메타데이터 없음',
     }));
     if (chars.length) ui.badges.appendChild(el('span', { class: 'imv-bdg plain', text: `캐릭터 ${chars.length}` }));
-    if (info.exif) ui.badges.appendChild(el('span', { class: 'imv-bdg plain', text: 'EXIF' }));
+    const camera = info.exif && ['Make', 'Model', 'DateTimeOriginal', 'ExposureTime', 'FNumber',
+      'ISO', 'FocalLength', 'LensModel', 'GPSLatitude'].some((k) => info.exif[k] !== undefined);
+    if (camera) ui.badges.appendChild(el('span', { class: 'imv-bdg plain', text: 'EXIF' }));
     if (info.c2pa) ui.badges.appendChild(el('span', { class: 'imv-bdg plain', text: 'C2PA' }));
     ui.badges.appendChild(el('span', {
       class: 'imv-bdg plain',
@@ -1574,7 +1594,7 @@
       } });
     }
 
-    if (info.exif) {
+    if (camera) {
       TABS.push({ name: '촬영', build: () => {
         const e = info.exif;
         const f = document.createDocumentFragment();
@@ -1784,25 +1804,30 @@
     return /namu\.la|dcimg|dcinside\.com\/viewimage/i.test(img.currentSrc || img.src || '');
   }
 
-  // Alt+클릭은 어떤 방식이든 항상 열기 (콘·아이콘도 강제로)
-  function isAlt(e) { return e.altKey && !e.ctrlKey && !e.metaKey && !e.shiftKey; }
-
-  // kind: 'click' | 'dblclick' — 지금 설정된 방식과 맞을 때만 연다
+  // 설정한 방법 하나로만 열린다.
+  // kind: 'click' | 'dblclick'
+  //  - 'alt'      설정 → Alt+클릭에만 반응 (그냥 클릭·더블클릭은 사이트 그대로)
+  //  - 'dblclick' 설정 → 더블클릭에만 반응 (Alt+클릭은 반응하지 않음)
+  //  - 'click'    설정 → 그냥 클릭에만 반응
+  // 어느 설정이든 Alt를 함께 누르면 디시콘·아이콘 제외 필터를 건너뛴다.
   function canOpen(img, e, kind) {
     if (!(img instanceof HTMLImageElement)) return false;
     if (img.closest('.imv-root, .imv-zoom')) return false;
-    if (isAlt(e)) return true;                       // Alt+클릭은 어느 설정에서든 열림
     if (e.ctrlKey || e.metaKey || e.shiftKey) return false;
+
+    if (CFG.openOn === 'alt') {
+      return kind === 'click' && e.altKey;          // Alt+클릭 전용
+    }
     if (CFG.openOn !== kind) return false;
+    if (e.altKey) return true;                      // 같은 동작 + Alt = 콘도 강제로 열기
     return isTargetImage(img);
   }
 
   // 더블클릭 방식일 때 첫 클릭으로 사이트가 반응해버리는 걸 막는다
   function shouldSwallowClick(img, e) {
-    if (isAlt(e)) return true;
+    if (CFG.openOn !== 'dblclick') return false;
     if (e.ctrlKey || e.metaKey || e.shiftKey) return false;
-    if (CFG.openOn === 'dblclick') return isTargetImage(img);
-    return false;
+    return e.altKey || isTargetImage(img);
   }
 
   const inViewer = (t) => (overlay && overlay.contains(t)) || (zoomLayer && zoomLayer.contains(t));
@@ -1836,7 +1861,7 @@
   }, true);
 
   document.addEventListener('dragstart', (e) => {
-    if (!isAlt(e) || inViewer(e.target)) return;
+    if (CFG.openOn !== 'alt' || !e.altKey || inViewer(e.target)) return;
     if (e.target && e.target.tagName === 'IMG') e.preventDefault();
   }, true);
 
@@ -1857,7 +1882,7 @@
       CFG.skipStickers = !CFG.skipStickers;
       store.set('skipStickers', CFG.skipStickers);
       toast('콘·아이콘 제외 ' + (CFG.skipStickers ? '켜짐 (게시글 사진만)' : '꺼짐 (전부 분석)')
-        + ' · Alt+클릭은 언제나 열립니다');
+        + ' · 같은 동작에 Alt를 함께 누르면 콘도 열립니다');
     });
   }
 
