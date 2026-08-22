@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         이미지 메타데이터 뷰어 (아카라이브 / 디시인사이드)
+// @name         이미지 메타데이터 뷰어
 // @namespace    https://github.com/local/img-meta-viewer
-// @version      4.4.0
+// @version      4.5.0
 // @description  아카라이브·디시인사이드에서 이미지를 Alt+클릭하면 페이지 안에 카드 팝업이 뜨고, EXIF와 NovelAI·ComfyUI·A1111 등 각종 AI 생성 메타데이터를 보여줍니다. 사이트 다크/라이트 테마 자동 대응.
 // @author       you
 // @match        https://arca.live/*
@@ -19,6 +19,7 @@
 // @connect      arca.live
 // @connect      dcinside.com
 // @connect      dcinside.co.kr
+// @connect      nstatic.dcinside.com
 // @connect      *
 // @run-at       document-end
 // @noframes
@@ -823,9 +824,33 @@
     return best;
   }
 
+  // 주소별로 알아낸 진짜 파일명을 기억해 둔다 (download.php 처럼 경로에 이름이 없는 경우용)
+  const NAME_HINT = new Map();
+
+  // 디시인사이드: 본문 이미지는 변환본(viewimage.php)이고,
+  // 원본은 글 아래 첨부파일 목록의 download.php 에 있다.
+  // 본문의 data-fileno 이미지 순서와 첨부 목록 순서가 1:1로 대응한다.
+  function dcAttachmentUrl(img) {
+    if (!img.hasAttribute('data-fileno')) return null;
+    const body = img.closest('.write_div, .writing_view_box') || document;
+    const imgs = [...body.querySelectorAll('img[data-fileno]')];
+    const links = [...document.querySelectorAll('.appending_file a[href], .appending_file_box a[href]')]
+      .filter((a) => /download\.php/i.test(a.getAttribute('href') || ''));
+    const i = imgs.indexOf(img);
+    if (i < 0 || links.length !== imgs.length || !links[i]) return null;
+    const href = links[i].getAttribute('href');
+    const name = (links[i].textContent || '').trim().split(/\s{2,}|\(/)[0].trim();
+    const abs = absUrl(href);
+    if (abs && name && /\.[a-z0-9]{2,5}$/i.test(name)) NAME_HINT.set(abs, name);
+    return href;
+  }
+
   function candidateUrls(img) {
     const set = [];
     const push = (u) => { const a = absUrl(u); if (a && !set.includes(a)) set.push(a); };
+
+    // 0) 디시인사이드 첨부파일 원본이 있으면 그것부터
+    if (IS_DC) { const at = dcAttachmentUrl(img); if (at) push(at); }
 
     // 1) 글에 달린 원본 링크가 가장 믿을 만하다
     const a = img.closest('a');
@@ -840,9 +865,11 @@
     const ss = fromSrcset(img);
     if (ss) push(ss);
 
-    // 3) 실제로 표시 중인 주소 (새 탭으로 여는 것과 같은 주소)
+    // 3) 실제로 표시 중인 주소 (지연로딩 자리표시자는 제외)
     const src = img.getAttribute('src') || img.currentSrc || img.src;
-    if (src) push(src);
+    const isPlaceholder = src && (/nstatic\.dcinside\.com/i.test(src) || /^data:/i.test(src)
+      || img.classList.contains('lazy'));
+    if (src && !isPlaceholder) push(src);
 
     // 4) 축소본으로 보이면 원본 변형도 후보에 넣는다
     if (src && /[?&]type=/.test(src)) {
@@ -875,10 +902,18 @@
         onload: (r) => {
           if (r.status >= 200 && r.status < 300 && r.response && r.response.byteLength > 100) {
             const u8 = new Uint8Array(r.response);
-            const cr = (r.responseHeaders || '').match(/content-range:\s*bytes\s+\d+-\d+\/(\d+)/i);
+            const hdr = r.responseHeaders || '';
+            const cr = hdr.match(/content-range:\s*bytes\s+\d+-\d+\/(\d+)/i);
+            let fname = null;
+            const cd = hdr.match(/content-disposition:\s*([^\r\n]+)/i);
+            if (cd) {
+              const st = cd[1].match(/filename\*=\s*UTF-8''([^;]+)/i);
+              const pl = cd[1].match(/filename\s*=\s*"?([^";]+)"?/i);
+              try { fname = st ? decodeURIComponent(st[1]) : (pl ? pl[1].trim() : null); } catch (e) { fname = pl ? pl[1].trim() : null; }
+            }
             // 206이면 일부만 받은 것, 200이면 서버가 Range를 무시하고 전체를 준 것
             resolve({
-              u8, url,
+              u8, url, filename: fname,
               partial: r.status === 206 && !!headBytes,
               total: cr ? +cr[1] : u8.length,
             });
@@ -1319,6 +1354,19 @@
     run(imgEl, { root, nm, stage, view, badges, tabs, pane, foot, theme });
   }
 
+  // 서버가 알려준 이름 > 링크에서 얻은 이름 > 주소 마지막 조각 순으로 파일명을 정한다
+  function pickFileName(res) {
+    const clean = (n) => (n || '').replace(/[\\/:*?"<>|]/g, '_').trim();
+    if (res.filename) return clean(res.filename);
+    const hint = NAME_HINT.get(res.url);
+    if (hint) return clean(hint);
+    let base = '';
+    try { base = decodeURIComponent(res.url.split('?')[0].split('/').pop() || ''); } catch (e) { base = ''; }
+    // viewimage.php / download.php 처럼 경로가 파일명이 아닌 경우
+    if (!base || /\.(php|asp|jsp|cgi)$/i.test(base)) return '이미지';
+    return clean(base);
+  }
+
   // 메타데이터는 대부분 파일 앞쪽에 있으므로 우선 이만큼만 받는다
   const HEAD_BYTES = 384 * 1024;
   // 앞부분에서 아무것도 못 찾았을 때 전체를 다시 확인하는 크기 한도
@@ -1346,7 +1394,7 @@
     let info = picked.info;
 
     const totalSize = res.total || bytes.length;
-    const fileName = decodeURIComponent((res.url.split('?')[0].split('/').pop()) || 'image');
+    const fileName = pickFileName(res);
 
     const getFull = async () => {
       if (!full) { const r2 = await fetchBytes(res.url); bytes = r2.u8; full = true; }
