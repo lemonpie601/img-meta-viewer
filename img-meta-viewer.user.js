@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         이미지 메타데이터 뷰어
 // @namespace    https://github.com/local/img-meta-viewer
-// @version      4.2.2
+// @version      4.3.0
 // @description  아카라이브·디시인사이드에서 이미지를 Alt+클릭하면 페이지 안에 카드 팝업이 뜨고, EXIF와 NovelAI·ComfyUI·A1111 등 각종 AI 생성 메타데이터를 보여줍니다. 사이트 다크/라이트 테마 자동 대응.
 // @author       you
 // @match        https://arca.live/*
@@ -1384,6 +1384,9 @@
     const ctx = {
       url: res.url, fileName, checkStealth,
       async download() {
+        // 확장프로그램 환경에서는 브라우저 기본 다운로드를 쓴다 (전체 전송 불필요)
+        const hook = typeof window !== 'undefined' && window.__imvDownload;
+        if (hook) { hook(res.url, fileName); return; }
         await getFull();
         const bu = URL.createObjectURL(new Blob([bytes]));
         const a = el('a', { href: bu, download: fileName });
@@ -1799,6 +1802,6 @@
 
   try {
     (typeof unsafeWindow !== 'undefined' ? unsafeWindow : window).__imvDebug =
-      { analyze, parsePNG, parseJPEG, parseWEBP, parseTIFF, detectFormat, interpretGenMeta, parseA1111, detectTheme, looksLikeSticker, isTargetImage };
+      { CFG, store, analyze, parsePNG, parseJPEG, parseWEBP, parseTIFF, detectFormat, interpretGenMeta, parseA1111, detectTheme, looksLikeSticker, isTargetImage };
   } catch (e) {}
 })();
