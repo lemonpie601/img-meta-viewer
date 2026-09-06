@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         이미지 메타데이터 뷰어
 // @namespace    https://github.com/local/img-meta-viewer
-// @version      4.7.0
+// @version      4.8.0
 // @description  아카라이브·디시인사이드에서 이미지를 Alt+클릭하면 페이지 안에 카드 팝업이 뜨고, EXIF와 NovelAI·ComfyUI·A1111 등 각종 AI 생성 메타데이터를 보여줍니다. 사이트 다크/라이트 테마 자동 대응.
 // @author       you
 // @match        https://arca.live/*
@@ -957,7 +957,7 @@
 
   // 같은 이미지라도 주소에 따라 메타데이터가 지워진 축소본이 오기도 한다.
   // 후보 주소를 차례로 확인해서 메타데이터가 살아있는 쪽을 고른다.
-  const MAX_CANDIDATES = 4;
+  const MAX_CANDIDATES = 3;
 
   function metaScore(info) {
     return (info.gen ? 8 : 0)
@@ -1385,18 +1385,36 @@
     return clean(base);
   }
 
-  // 메타데이터는 대부분 파일 앞쪽에 있으므로 우선 이만큼만 받는다
-  const HEAD_BYTES = 384 * 1024;
-  // 앞부분에서 아무것도 못 찾았을 때 전체를 다시 확인하는 크기 한도
-  // (메타데이터를 파일 뒤쪽에 붙여 저장하는 프로그램도 있다)
-  const FULL_RETRY_MAX = 30 * 1024 * 1024;
   // 이보다 큰 파일은 은닉 메타데이터 검사를 자동으로 하지 않는다 (버튼으로 넘김)
   const STEALTH_AUTO_MAX = 12 * 1024 * 1024;
 
+  // 한 번 분석한 이미지는 기억해 둔다 (같은 이미지를 다시 열면 즉시 표시)
+  const CACHE = new Map();
+  const CACHE_MAX = 30;
+  function cacheGet(key) { return CACHE.get(key); }
+  function cachePut(key, val) {
+    CACHE.set(key, val);
+    if (CACHE.size > CACHE_MAX) CACHE.delete(CACHE.keys().next().value);
+  }
+
   async function run(imgEl, ui) {
     const urls = candidateUrls(imgEl);
+    const cacheKey = urls[0] || '';
+
+    // 이미 분석해 둔 이미지면 네트워크 없이 바로 보여준다
+    const hit = cacheGet(cacheKey);
+    if (hit) {
+      ui.view.src = hit.res.url;
+      ui.nm.textContent = hit.fileName;
+      ui.nm.title = hit.res.url;
+      render(ui, hit.info, hit.res, hit.fileName, hit.ctx(ui));
+      return;
+    }
+
     let picked;
-    try { picked = await resolveBest(urls, HEAD_BYTES); }
+    // 파일 전체를 한 번에 받는다. 앞부분만 먼저 받아보면 메타데이터가
+    // 파일 끝에 있을 때 두 번 왕복하게 되어 오히려 느리다.
+    try { picked = await resolveBest(urls); }
     catch (e) {
       ui.nm.textContent = '원본을 가져오지 못했습니다';
       ui.pane.innerHTML = '';
@@ -1419,29 +1437,6 @@
       return bytes;
     };
 
-    // 앞부분만 받았는데 아무것도 못 찾았으면 파일 전체를 다시 살펴본다.
-    // 메타데이터가 파일 끝쪽에 붙어 있는 경우가 있다.
-    if (!full && !info.gen && !info.exif && totalSize <= FULL_RETRY_MAX) {
-      try {
-        await getFull();
-        const again = await analyze(bytes, null);
-        if (metaScore(again) >= metaScore(info)) info = again;
-      } catch (e) { /* 앞부분 결과로 진행 */ }
-    }
-
-    // 은닉 메타데이터 확인은 파일 전체가 필요하다.
-    // 파일이 크면 자동으로 받지 않고 버튼으로 넘긴다.
-    const checkStealth = async () => {
-      await getFull();
-      const bu = URL.createObjectURL(new Blob([bytes]));
-      if (ui.root._blobUrl) URL.revokeObjectURL(ui.root._blobUrl);
-      ui.root._blobUrl = bu;
-      ui.view.src = bu;             // 이미 받은 바이트를 표시에도 재사용
-      const next = await analyze(bytes, bu);
-      next.size = totalSize;
-      render(ui, next, res, fileName, ctx);
-    };
-
     if (info.needStealth) {
       if (totalSize <= STEALTH_AUTO_MAX) {
         await getFull();
@@ -1453,27 +1448,57 @@
         info.stealthDeferred = totalSize;
       }
     }
-    // 전체를 받지 않았다면 원본 주소로 표시 (브라우저 캐시를 탄다)
-    if (!ui.root._blobUrl) ui.view.src = res.url;
+    // 이미 받아둔 바이트를 그대로 화면에 쓴다 — 같은 이미지를 또 내려받지 않는다
+    if (!ui.root._blobUrl && bytes) {
+      const bu = URL.createObjectURL(new Blob([bytes]));
+      ui.root._blobUrl = bu;
+      ui.view.src = bu;
+    } else if (!ui.root._blobUrl) {
+      ui.view.src = res.url;
+    }
     info.size = totalSize;
 
     ui.nm.textContent = fileName;
     ui.nm.title = res.url;
 
-    const ctx = {
-      url: res.url, fileName, checkStealth,
-      async download() {
-        // 확장프로그램 환경에서는 브라우저 기본 다운로드를 쓴다 (전체 전송 불필요)
-        const hook = typeof window !== 'undefined' && window.__imvDownload;
-        if (hook) { hook(res.url, fileName); return; }
-        await getFull();
-        const bu = URL.createObjectURL(new Blob([bytes]));
-        const a = el('a', { href: bu, download: fileName });
-        document.body.appendChild(a); a.click(); a.remove();
-        setTimeout(() => URL.revokeObjectURL(bu), 10000);
-      },
+    // 팝업마다 새로 만들어 쓰는 동작 묶음 (캐시에서 다시 열 때도 재사용)
+    const lite = { url: res.url, total: totalSize, filename: res.filename };
+    const makeCtx = (theUi) => {
+      let buf = null;                       // 필요할 때만 다시 받는다 (메모리 절약)
+      const need = async () => {
+        if (!buf) { const r2 = await fetchBytes(lite.url); buf = r2.u8; }
+        return buf;
+      };
+      const c = {
+        url: lite.url, fileName,
+        async checkStealth() {
+          const b = await need();
+          const bu = URL.createObjectURL(new Blob([b]));
+          if (theUi.root._blobUrl) URL.revokeObjectURL(theUi.root._blobUrl);
+          theUi.root._blobUrl = bu;
+          theUi.view.src = bu;
+          const next = await analyze(b, bu);
+          next.size = totalSize;
+          cachePut(cacheKey, { res: lite, fileName, info: next, ctx: makeCtx });
+          render(theUi, next, lite, fileName, c);
+        },
+        async download() {
+          // 확장프로그램 환경에서는 브라우저 기본 다운로드를 쓴다 (전송 불필요)
+          const hook = typeof window !== 'undefined' && window.__imvDownload;
+          if (hook) { hook(lite.url, fileName); return; }
+          const b = await need();
+          const bu = URL.createObjectURL(new Blob([b]));
+          const a = el('a', { href: bu, download: fileName });
+          document.body.appendChild(a); a.click(); a.remove();
+          setTimeout(() => URL.revokeObjectURL(bu), 10000);
+        },
+      };
+      return c;
     };
-    render(ui, info, res, fileName, ctx);
+
+    cachePut(cacheKey, { res: lite, fileName, info, ctx: makeCtx });
+    bytes = null;                            // 분석이 끝났으니 원본 바이트는 놓아준다
+    render(ui, info, res, fileName, makeCtx(ui));
   }
 
   /* =========================================================
