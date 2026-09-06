@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         이미지 메타데이터 뷰어
+// @name         이미지 메타데이터 뷰어 (아카라이브 / 디시인사이드)
 // @namespace    https://github.com/local/img-meta-viewer
-// @version      4.8.0
+// @version      5.0.0
 // @description  아카라이브·디시인사이드에서 이미지를 Alt+클릭하면 페이지 안에 카드 팝업이 뜨고, EXIF와 NovelAI·ComfyUI·A1111 등 각종 AI 생성 메타데이터를 보여줍니다. 사이트 다크/라이트 테마 자동 대응.
 // @author       you
 // @match        https://arca.live/*
@@ -866,41 +866,42 @@
   function candidateUrls(img) {
     const set = [];
     const push = (u) => { const a = absUrl(u); if (a && !set.includes(a)) set.push(a); };
+    const isPlaceholder = (u) => !u || /nstatic\.dcinside\.com/i.test(u) || /^data:/i.test(u);
 
-    // 0) 디시인사이드 첨부파일 원본이 있으면 그것부터
-    if (IS_DC) { const at = dcAttachmentUrl(img); if (at) push(at); }
+    // 1) 이미 화면에 떠 있는 주소가 1순위.
+    //    브라우저 캐시에 있어 즉시 읽히고, 사이트 원본 서버는 같은 파일인데도
+    //    응답이 수 초 걸리는 경우가 있다 (아카라이브 ac-o 등).
+    const shown = img.currentSrc || img.getAttribute('src') || '';
+    if (!isPlaceholder(shown) && !img.classList.contains('lazy')) push(shown);
 
-    // 1) 글에 달린 원본 링크가 가장 믿을 만하다
-    const a = img.closest('a');
-    if (a && a.href && /\.(png|jpe?g|gif|webp|bmp|avif)(\?|$)/i.test(a.href)) push(a.href);
-    if (a && a.href && /(namu\.la|dcinside|dcimg)/i.test(a.href)) push(a.href);
-
-    // 2) 사이트가 알려주는 원본 주소 / 지연 로딩 주소
-    for (const attr of ['data-originalurl', 'data-orig', 'data-original', 'data-src', 'data-lazy-src', 'data-echo']) {
+    // 2) 사이트가 알려주는 원본 주소 (지연로딩이면 이게 진짜 주소다)
+    for (const attr of ['data-original', 'data-originalurl', 'data-orig', 'data-src', 'data-lazy-src', 'data-echo']) {
       const v = img.getAttribute(attr);
-      if (v) push(v);
+      if (v && !isPlaceholder(v)) push(v);
     }
     const ss = fromSrcset(img);
     if (ss) push(ss);
 
-    // 3) 실제로 표시 중인 주소 (지연로딩 자리표시자는 제외)
-    const src = img.getAttribute('src') || img.currentSrc || img.src;
-    const isPlaceholder = src && (/nstatic\.dcinside\.com/i.test(src) || /^data:/i.test(src)
-      || img.classList.contains('lazy'));
-    if (src && !isPlaceholder) push(src);
-
-    // 4) 축소본으로 보이면 원본 변형도 후보에 넣는다
-    if (src && /[?&]type=/.test(src)) {
+    // 3) 축소본으로 보이면 원본 변형도
+    const src = img.getAttribute('src') || img.currentSrc || '';
+    if (!isPlaceholder(src) && /[?&]type=/.test(src)) {
       push(src.replace(/([?&])type=[^&]*/, '$1type=orig'));
       push(src.replace(/([?&])type=[^&]*&?/, '$1').replace(/[?&]$/, ''));
     }
+
+    // 4) 글에 달린 원본 링크 (원본 서버라 느릴 수 있어 뒤로 둔다)
+    const a = img.closest('a');
+    if (a && a.href && /\.(png|jpe?g|gif|webp|bmp|avif)(\?|$)/i.test(a.href)) push(a.href);
+    if (a && a.href && /(namu\.la|arca\.live|dcinside|dcimg)/i.test(a.href)) push(a.href);
+
     if (IS_DC) {
       const oc = img.getAttribute('onclick') || (img.parentElement && img.parentElement.getAttribute('onclick')) || '';
-      const m = oc.match(/https?:\/\/[^'"\s)]+/);
+      const m = oc.match(/https?:\/\/[^\'"\s)]+/);
       if (m) push(m[0]);
-      if (src) push(src.replace(/&?t=\d+/g, ''));
+      // 첨부파일 원본은 마지막 보루. 본문 이미지에서 메타데이터를 찾으면 쓰지 않는다.
+      const at = dcAttachmentUrl(img);
+      if (at) push(at);
     }
-    if (img.currentSrc) push(img.currentSrc);
     return set;
   }
 
@@ -916,7 +917,7 @@
       const headers = { Referer: refererFor(url), Accept: 'image/*,*/*' };
       if (headBytes) headers.Range = 'bytes=0-' + (headBytes - 1);
       GM_xmlhttpRequest({
-        method: 'GET', url, responseType: 'arraybuffer', headers, timeout: 30000,
+        method: 'GET', url, responseType: 'arraybuffer', headers, timeout: 15000,
         onload: (r) => {
           if (r.status >= 200 && r.status < 300 && r.response && r.response.byteLength > 100) {
             const u8 = new Uint8Array(r.response);
@@ -966,21 +967,52 @@
       + (info.needStealth ? 1 : 0);
   }
 
-  async function resolveBest(urls, headBytes) {
-    let best = null, lastErr = null, tried = 0;
-    for (const u of urls) {
-      if (tried >= MAX_CANDIDATES) break;
-      let r;
-      try { r = await fetchBytes(u, headBytes); } catch (e) { lastErr = e; continue; }
-      if (detectFormat(r.u8) === 'UNKNOWN') { lastErr = new Error('이미지가 아님'); continue; }
-      tried++;
-      let info;
-      try { info = await analyze(r.u8, null); } catch (e) { continue; }
-      const score = metaScore(info);
-      const bigger = best && (r.total || 0) > (best.res.total || 0);
-      if (!best || score > best.score || (score === best.score && bigger)) best = { res: r, info, score };
-      if (score >= 8) break;   // 생성 메타데이터를 찾았으면 더 볼 필요 없음
+  // 첫 후보가 느리면 기다리지 않고 다음 후보도 같이 시도한다.
+  // (아카라이브 원본 서버처럼 같은 파일인데 응답이 수 초 걸리는 주소가 있다)
+  const HEDGE_MS = 600;
+
+  async function resolveBest(urls, expect) {
+    const list = urls.slice(0, MAX_CANDIDATES);
+    if (!list.length) throw new Error('주소를 찾지 못했습니다');
+
+    let best = null, lastErr = null;
+    const running = [];
+
+    const launch = (u) => {
+      const task = (async () => {
+        const r = await fetchBytes(u);
+        if (detectFormat(r.u8) === 'UNKNOWN') throw new Error('이미지가 아님');
+        let info = await analyze(r.u8, null);
+        // 알파 채널 은닉 메타데이터까지 여기서 확인해야 이 후보로 끝낼지 판단할 수 있다.
+        // (확인하지 않으면 느린 후보를 끝까지 기다리게 된다)
+        if (info.needStealth && (r.total || r.u8.length) <= STEALTH_AUTO_MAX) {
+          const bu = URL.createObjectURL(new Blob([r.u8]));
+          try { info = await analyze(r.u8, bu); } finally { URL.revokeObjectURL(bu); }
+        }
+        let score = metaScore(info);
+        // 클릭한 이미지와 크기가 다르면 다른 파일이다 (첨부 순서가 어긋난 경우)
+        if (expect && info.width && info.height
+            && (info.width !== expect.w || info.height !== expect.h)) score -= 100;
+        const cand = { res: r, info, score };
+        const bigger = best && (r.total || 0) > (best.res.total || 0);
+        if (!best || score > best.score || (score === best.score && bigger)) best = cand;
+        return cand;
+      })().catch((e) => { lastErr = e; return null; });
+      running.push(task);
+      return task;
+    };
+
+    for (let i = 0; i < list.length; i++) {
+      launch(list[i]);
+      const done = Promise.allSettled(running.slice()).then(() => 'done');
+      const wait = i < list.length - 1
+        ? Promise.race([done, new Promise((r) => setTimeout(() => r('hedge'), HEDGE_MS))])
+        : done;
+      const how = await wait;
+      if (best && best.score >= 8) return best;      // 생성 메타데이터를 찾았으면 끝
+      if (how === 'done' && i === list.length - 1) break;
     }
+    await Promise.allSettled(running);
     if (!best) throw lastErr || new Error('불러오기 실패');
     return best;
   }
@@ -1397,6 +1429,14 @@
     if (CACHE.size > CACHE_MAX) CACHE.delete(CACHE.keys().next().value);
   }
 
+  // 클릭한 이미지의 진짜 크기 (지연로딩 자리표시자면 알 수 없음)
+  function expectedSize(img) {
+    const src = img.currentSrc || img.src || '';
+    if (img.classList.contains('lazy') || /nstatic\.dcinside\.com/i.test(src)) return null;
+    const w = img.naturalWidth, h = img.naturalHeight;
+    return (w > 50 && h > 50) ? { w, h } : null;
+  }
+
   async function run(imgEl, ui) {
     const urls = candidateUrls(imgEl);
     const cacheKey = urls[0] || '';
@@ -1414,7 +1454,7 @@
     let picked;
     // 파일 전체를 한 번에 받는다. 앞부분만 먼저 받아보면 메타데이터가
     // 파일 끝에 있을 때 두 번 왕복하게 되어 오히려 느리다.
-    try { picked = await resolveBest(urls); }
+    try { picked = await resolveBest(urls, expectedSize(imgEl)); }
     catch (e) {
       ui.nm.textContent = '원본을 가져오지 못했습니다';
       ui.pane.innerHTML = '';
